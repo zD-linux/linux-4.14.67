@@ -809,10 +809,23 @@ void tcp_release_cb(struct sock *sk)
 {
 	unsigned long flags, nflags;
 
+    /* zym: deferred from qbackoff_tasklet_func */
+    struct tcp_sock *tp = tcp_sk(sk);
+    unsigned long qbackoff_flags, nqbackoff_flags;
+    do {
+        qbackoff_flags = tp->qbackoff_flags;
+        if(!(qbackoff_flags & QBACKOFF_DEFERRED_B))
+            break;
+        nqbackoff_flags = qbackoff_flags & ~QBACKOFF_DEFERRED_B;
+    }while(cmpxchg(&tp->qbackoff_flags, qbackoff_flags, nqbackoff_flags) != qbackoff_flags);
+
+    if(qbackoff_flags & QBACKOFF_DEFERRED_B)
+        tcp_tsq_handler(sk);
+
 	/* perform an atomic operation only if at least one flag is set */
 	do {
 		flags = sk->sk_tsq_flags;
-		if (!(flags & TCP_DEFERRED_ALL))
+		if (!(flags & TCP_DEFERRED_ALL)) 
 			return;
 		nflags = flags & ~TCP_DEFERRED_ALL;
 	} while (cmpxchg(&sk->sk_tsq_flags, flags, nflags) != flags);
@@ -846,19 +859,128 @@ void tcp_release_cb(struct sock *sk)
 }
 EXPORT_SYMBOL(tcp_release_cb);
 
+/* zym: similar to tsq_tasklet */
+struct qbackoff_tasklet {
+    struct tasklet_struct   tasklet;
+    struct list_head        head;
+};
+static DEFINE_PER_CPU(struct qbackoff_tasklet, qbackoff_tasklet);
+
+
+/* zym : similar to tsq_tasklet_func */
+static void qbackoff_tasklet_func(unsigned long data)
+{
+    struct qbackoff_tasklet *qbackoff = (struct qbackoff_tasklet *)data;
+    LIST_HEAD(list);
+    unsigned long flags;
+    struct list_head *q, *n; 
+    struct tcp_sock *tp;
+    struct sock *sk;
+
+    local_irq_save(flags);
+    list_splice_init(&qbackoff->head, &list);
+    local_irq_restore(flags);
+
+    list_for_each_safe(q, n, &list){
+        tp = list_entry(q, struct tcp_sock, qbackoff_node);
+        list_del(&tp->qbackoff_node);
+
+        sk = (struct sock *)tp;
+        smp_mb__before_atomic();
+        clear_bit(QBACKOFF_TASKLET_QUEUED, &tp->qbackoff_flags);
+
+        if(!sk->sk_lock.owned &&
+           test_bit(QBACKOFF_DEFERRED, &tp->qbackoff_flags)){
+            bh_lock_sock(sk);
+            if(!sock_owned_by_user(sk)){
+                clear_bit(QBACKOFF_DEFERRED, &tp->qbackoff_flags);
+                tcp_tsq_handler(sk);
+            }
+            bh_unlock_sock(sk);
+        }
+
+        sk_free(sk);
+    }
+}
+
 void __init tcp_tasklet_init(void)
 {
 	int i;
 
 	for_each_possible_cpu(i) {
 		struct tsq_tasklet *tsq = &per_cpu(tsq_tasklet, i);
+        struct qbackoff_tasklet *qbackoff = &per_cpu(qbackoff_tasklet, i); /* zym */
 
 		INIT_LIST_HEAD(&tsq->head);
 		tasklet_init(&tsq->tasklet,
 			     tcp_tasklet_func,
 			     (unsigned long)tsq);
+
+        /* zym */
+        INIT_LIST_HEAD(&qbackoff->head);
+        tasklet_init(&qbackoff->tasklet,
+                 qbackoff_tasklet_func,
+                 (unsigned long)qbackoff);
+
 	}
+
+    /* zym */
+    qbackoff_global_list = kmalloc(sizeof(struct qbackoff_list), GFP_KERNEL);
+    INIT_LIST_HEAD(&qbackoff_global_list->head);
+    qbackoff_global_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+    spin_lock_init(qbackoff_global_lock);
 }
+
+void qbackoff_add_tasklet(void){
+    LIST_HEAD(list);
+    struct tcp_sock *tp;
+    struct sock *sk;
+    unsigned long flags, nval, oval;
+    struct list_head *q, *n;
+    struct qbackoff_tasklet *qbackoff;
+    bool empty;
+
+    //iterate over every element (tcp_sock) in the global list. If tp is not in the tasklet list, add it to the tasklet list
+    spin_lock_irqsave(qbackoff_global_lock, flags);
+    list_for_each_safe(q, n, &qbackoff_global_list->head){
+        tp = list_entry(q, struct tcp_sock, qbackoff_global_node);
+        sk = (struct sock*)tp;
+        
+        list_del(&tp->qbackoff_global_node);
+        qbackoff_global_list->len--;
+        
+        //clear STOP bit: resume tcp
+        bool tasklet_queued = false;
+        for(oval = READ_ONCE(tp->qbackoff_flags);; oval = nval){
+            if(oval & QBACKOFF_TASKLET_QUEUED_B){
+                nval = (oval & ~QBACKOFF_STOP_B & ~QBACKOFF_GLOBAL_QUEUED_B) | QBACKOFF_RELEASE_B;
+                tasklet_queued = true;
+            }
+            else{
+                nval = (oval & ~QBACKOFF_STOP_B & ~QBACKOFF_GLOBAL_QUEUED_B) | QBACKOFF_TASKLET_QUEUED_B | QBACKOFF_DEFERRED_B | QBACKOFF_RELEASE_B;
+            }
+
+            nval = cmpxchg(&tp->qbackoff_flags, oval, nval);
+
+            if(nval != oval)
+                continue;
+            break;
+        }
+       
+        //add to tasklet
+        if(!tasklet_queued){
+            qbackoff = this_cpu_ptr(&qbackoff_tasklet);
+            empty = list_empty(&qbackoff->head);
+            list_add(&tp->qbackoff_node, &qbackoff->head);
+            if(empty)
+                tasklet_schedule(&qbackoff->tasklet);
+        }
+        break;
+    }
+
+    spin_unlock_irqrestore(qbackoff_global_lock, flags);
+}
+
 
 /*
  * Write buffer destructor automatically called from kfree_skb.
@@ -886,29 +1008,15 @@ void tcp_wfree(struct sk_buff *skb)
 	if (refcount_read(&sk->sk_wmem_alloc) >= SKB_TRUESIZE(1) && this_cpu_ksoftirqd() == current)
 		goto out;
 
-	for (oval = READ_ONCE(sk->sk_tsq_flags);; oval = nval) {
-		struct tsq_tasklet *tsq;
-		bool empty;
+    /* zym */
+    if(test_bit(QBACKOFF_STOP, &tp->qbackoff_flags))
+        goto out;
 
-		if (!(oval & TSQF_THROTTLED) || (oval & TSQF_QUEUED))
-			goto out;
-
-		nval = (oval & ~TSQF_THROTTLED) | TSQF_QUEUED | TCPF_TSQ_DEFERRED;
-		nval = cmpxchg(&sk->sk_tsq_flags, oval, nval);
-		if (nval != oval)
-			continue;
-
-		/* queue this socket to tasklet queue */
-		local_irq_save(flags);
-		tsq = this_cpu_ptr(&tsq_tasklet);
-		empty = list_empty(&tsq->head);
-		list_add(&tp->tsq_node, &tsq->head);
-		if (empty)
-			tasklet_schedule(&tsq->tasklet);
-		local_irq_restore(flags);
-		return;
-	}
+    /* zym */
+    qbackoff_add_tasklet();
 out:
+     if(test_bit(QBACKOFF_GLOBAL_QUEUED, &tp->qbackoff_flags) || test_bit(QBACKOFF_TASKLET_QUEUED, &tp->qbackoff_flags))
+         return;
 	sk_free(sk);
 }
 
@@ -978,6 +1086,8 @@ static void tcp_internal_pacing(struct sock *sk, const struct sk_buff *skb)
 		      HRTIMER_MODE_ABS_PINNED);
 }
 
+  
+
 /* This routine actually transmits TCP packets queued in by
  * tcp_do_sendmsg().  This is used by both the initial
  * transmission and possible later retransmissions.
@@ -1006,14 +1116,18 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
 	tp = tcp_sk(sk);
 
+    struct sk_buff *fskb = skb;  /* zym */
+
 	if (clone_it) {
 		TCP_SKB_CB(skb)->tx.in_flight = TCP_SKB_CB(skb)->end_seq
 			- tp->snd_una;
 		oskb = skb;
-		if (unlikely(skb_cloned(skb)))
+		if (unlikely(skb_cloned(skb))){
 			skb = pskb_copy(skb, gfp_mask);
-		else
+        }
+		else{
 			skb = skb_clone(skb, gfp_mask);
+        }
 		if (unlikely(!skb))
 			return -ENOBUFS;
 	}
@@ -1054,6 +1168,9 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	skb->destructor = skb_is_tcp_pure_ack(skb) ? __sock_wfree : tcp_wfree;
 	skb_set_hash_from_sk(skb, sk);
 	refcount_add(skb->truesize, &sk->sk_wmem_alloc);
+    /* zym */
+    if(tcb->qbackoff_skb_pushed == 0)
+        fskb->qbackoff_wmem_delta = 0;
 
 	skb_set_dst_pending_confirm(skb, sk->sk_dst_pending_confirm);
 
@@ -1128,12 +1245,18 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			       sizeof(struct inet6_skb_parm)));
 
 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
-
-	if (unlikely(err > 0)) {
+	
+	/* zym: keep logic intact */
+    if(err == NET_XMIT_BACKOFF){
+        set_bit(QBACKOFF_STOP, &tp->qbackoff_flags);
+    }
+	if (unlikely(err > 0 && err != NET_XMIT_BACKOFF)) {
 		tcp_enter_cwr(sk);
 		err = net_xmit_eval(err);
+
 	}
-	if (!err && oskb) {
+	/* zym: keep logic intact */
+	if ((!err || err == NET_XMIT_BACKOFF) && oskb) {  
 		oskb->skb_mstamp = tp->tcp_mstamp;
 		tcp_rate_skb_sent(sk, oskb);
 	}
@@ -2183,6 +2306,8 @@ static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 				  unsigned int factor)
 {
 	unsigned int limit;
+    struct tcp_sock *tp = tcp_sk(sk);
+    unsigned long flags;
 
 	limit = max(2 * skb->truesize, sk->sk_pacing_rate >> 10);
 	limit = min_t(u32, limit, sysctl_tcp_limit_output_bytes);
@@ -2199,7 +2324,7 @@ static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
 			return false;
 
 		set_bit(TSQ_THROTTLED, &sk->sk_tsq_flags);
-		/* It is possible TX completion already happened
+        /* It is possible TX completion already happened
 		 * before we set TSQ_THROTTLED, so we must
 		 * test again the condition.
 		 */
@@ -2297,6 +2422,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		if (tcp_pacing_check(sk))
 			break;
 
+
 		tso_segs = tcp_init_tso_segs(skb, mss_now);
 		BUG_ON(!tso_segs);
 
@@ -2346,11 +2472,22 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 
 		if (test_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags))
 			clear_bit(TCP_TSQ_DEFERRED, &sk->sk_tsq_flags);
-		if (tcp_small_queue_check(sk, skb, 0))
+		/*if (tcp_small_queue_check(sk, skb, 0))
+			break;*/
+
+		/* zym : break if needs to back off */
+        if (test_bit(QBACKOFF_DEFERRED, &tcp_sk(sk)->qbackoff_flags))
+            clear_bit(QBACKOFF_DEFERRED, &tcp_sk(sk)->qbackoff_flags);
+
+        if (test_bit(QBACKOFF_STOP, &tcp_sk(sk)->qbackoff_flags))
+            break;
+
+        if (tcp_small_queue_check(sk, skb, 0))
+            break;
+
+        if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
 
-		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
-			break;
 
 repair:
 		/* Advance the send_head.  This one is sent out.

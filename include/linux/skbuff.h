@@ -686,6 +686,7 @@ struct sk_buff {
 	 * first. This is owned by whoever has the skb queued ATM.
 	 */
 	char			cb[48] __aligned(8);
+    __u64           qbackoff_wmem_delta;
 
 	unsigned long		_skb_refdst;
 	void			(*destructor)(struct sk_buff *skb);
@@ -954,6 +955,7 @@ static inline bool skb_unref(struct sk_buff *skb)
 
 void skb_release_head_state(struct sk_buff *skb);
 void kfree_skb(struct sk_buff *skb);
+void qbackoff_free_skb(struct sk_buff *skb);    /* zym */
 void kfree_skb_list(struct sk_buff *segs);
 void skb_tx_error(struct sk_buff *skb);
 void consume_skb(struct sk_buff *skb);

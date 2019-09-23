@@ -280,6 +280,14 @@ extern atomic_long_t tcp_memory_allocated;
 extern struct percpu_counter tcp_sockets_allocated;
 extern unsigned long tcp_memory_pressure;
 
+/* zym */
+struct qbackoff_list {
+    struct list_head head;
+    long len;
+};
+extern struct qbackoff_list *qbackoff_global_list;
+extern spinlock_t *qbackoff_global_lock;
+
 /* optimized version of sk_under_memory_pressure() for TCP sockets */
 static inline bool tcp_under_memory_pressure(const struct sock *sk)
 {
@@ -821,7 +829,8 @@ struct tcp_skb_cb {
 	__u8		txstamp_ack:1,	/* Record TX timestamp for ack? */
 			eor:1,		/* Is skb MSG_EOR marked? */
 			has_rxtstamp:1,	/* SKB has a RX timestamp	*/
-			unused:5;
+            qbackoff_skb_pushed:1, /* zym: skb has size has been added to sk-wmem once */
+			unused:4;
 	__u32		ack_seq;	/* Sequence number ACK'd	*/
 	union {
 		struct {
@@ -849,6 +858,7 @@ struct tcp_skb_cb {
 			void *data_end;
 		} bpf;
 	};
+    
 };
 
 #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
@@ -2037,6 +2047,7 @@ static inline void tcp_listendrop(const struct sock *sk)
 }
 
 enum hrtimer_restart tcp_pace_kick(struct hrtimer *timer);
+enum hrtimer_restart tcp_qbackoff_kick(struct hrtimer *timer); /* zym */
 
 /*
  * Interface for adding Upper Level Protocols over TCP

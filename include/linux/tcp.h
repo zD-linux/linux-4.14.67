@@ -363,6 +363,12 @@ struct tcp_sock {
 	 */
 	struct request_sock *fastopen_rsk;
 	u32	*saved_syn;
+
+/* zym: qbackoff*/
+    struct list_head qbackoff_node;
+    struct list_head qbackoff_global_node;
+    unsigned long qbackoff_flags;
+    unsigned long qbackoff_pktcount;
 };
 
 enum tsq_enum {
@@ -383,6 +389,23 @@ enum tsq_flags {
 	TCPF_WRITE_TIMER_DEFERRED	= (1UL << TCP_WRITE_TIMER_DEFERRED),
 	TCPF_DELACK_TIMER_DEFERRED	= (1UL << TCP_DELACK_TIMER_DEFERRED),
 	TCPF_MTU_REDUCED_DEFERRED	= (1UL << TCP_MTU_REDUCED_DEFERRED),
+};
+
+/* zym: qbackoff enums */
+enum qbackoff_enum {
+    QBACKOFF_GLOBAL_QUEUED,
+    QBACKOFF_TASKLET_QUEUED,
+    QBACKOFF_DEFERRED,
+    QBACKOFF_STOP,
+    QBACKOFF_RELEASE,
+};
+
+enum qbackoff_flags {
+    QBACKOFF_GLOBAL_QUEUED_B = (1UL << QBACKOFF_GLOBAL_QUEUED),
+    QBACKOFF_TASKLET_QUEUED_B = (1UL << QBACKOFF_TASKLET_QUEUED),
+    QBACKOFF_DEFERRED_B = (1UL << QBACKOFF_DEFERRED),
+    QBACKOFF_STOP_B = (1UL << QBACKOFF_STOP),
+    QBACKOFF_RELEASE_B = (1UL << QBACKOFF_RELEASE),
 };
 
 static inline struct tcp_sock *tcp_sk(const struct sock *sk)
