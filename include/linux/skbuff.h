@@ -444,6 +444,12 @@ enum {
  */
 struct ubuf_info {
 	void (*callback)(struct ubuf_info *, bool zerocopy_success);
+	
+	bool (*vhost_qavail_callback)(struct ubuf_info *);	/* zym */
+	void (*vhost_qfull_callback)(struct ubuf_info *);
+	u16 backoff_last_avail_idx;
+	u16 vq;
+
 	union {
 		struct {
 			unsigned long desc;
@@ -685,7 +691,7 @@ struct sk_buff {
 	 * want to keep them across layers you have to do a skb_clone()
 	 * first. This is owned by whoever has the skb queued ATM.
 	 */
-	char			cb[48] __aligned(8);
+	char			cb[72] __aligned(8);	/* zym: original number is 48 */
 
 	unsigned long		_skb_refdst;
 	void			(*destructor)(struct sk_buff *skb);
@@ -955,6 +961,11 @@ static inline bool skb_unref(struct sk_buff *skb)
 void skb_release_head_state(struct sk_buff *skb);
 void kfree_skb(struct sk_buff *skb);
 void kfree_skb_list(struct sk_buff *segs);
+
+/* zym */
+void kfree_skb_wo_zcopy_clear(struct sk_buff *skb);
+void kfree_skb_qfull(struct sk_buff *skb);
+
 void skb_tx_error(struct sk_buff *skb);
 void consume_skb(struct sk_buff *skb);
 void __consume_stateless_skb(struct sk_buff *skb);
