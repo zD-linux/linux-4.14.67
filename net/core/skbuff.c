@@ -671,6 +671,83 @@ void kfree_skb_list(struct sk_buff *segs)
 }
 EXPORT_SYMBOL(kfree_skb_list);
 
+/* zym */
+void kfree_skb_qfull(struct sk_buff *skb)
+{
+	if(!skb_unref(skb)){
+		printk(KERN_DEBUG "kfree_skb_qfull return at skb_unref");	/* zym */
+		return;
+	}
+
+	trace_kfree_skb(skb, __builtin_return_address(0));
+
+	skb_release_head_state(skb);
+	if (likely(skb->head)){
+		struct skb_shared_info *shinfo = skb_shinfo(skb);
+		int i;
+
+		if (skb->cloned &&
+	    		atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
+			      &shinfo->dataref))
+			return;
+
+		for (i = 0; i < shinfo->nr_frags; i++)
+			__skb_frag_unref(&shinfo->frags[i]);
+
+		if (shinfo->frag_list)
+			kfree_skb_list(shinfo->frag_list);
+
+		//skb_zcopy_clear(skb, true);
+		struct ubuf_info *uarg = skb_zcopy(skb);
+		if(uarg){
+			if (uarg->callback == sock_zerocopy_callback) 
+				printk(KERN_DEBUG "sock_zero_copy_callback should be called");
+			uarg->vhost_qfull_callback(uarg);
+			//uarg->callback(uarg, true);
+			skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
+		}else{
+			printk(KERN_DEBUG "uarg null");
+			struct iphdr *ipp = (struct iphdr *)skb_network_header(skb);
+			if(ipp->protocol == IPPROTO_TCP)
+				printk(KERN_DEBUG "tcp");
+		}
+
+		skb_free_head(skb);
+	}
+	kfree_skbmem(skb);
+}
+EXPORT_SYMBOL(kfree_skb_qfull);
+
+/* zym */
+void kfree_skb_wo_zcopy_clear(struct sk_buff *skb)
+{
+	if (!skb_unref(skb))
+		return;
+
+	trace_kfree_skb(skb, __builtin_return_address(0));
+
+	skb_release_head_state(skb);
+	if(likely(skb->head)){
+		struct skb_shared_info *shinfo = skb_shinfo(skb);
+		int i;
+
+		if (skb->cloned &&
+	    		atomic_sub_return(skb->nohdr ? (1 << SKB_DATAREF_SHIFT) + 1 : 1,
+			      &shinfo->dataref))
+			return;
+
+		for (i = 0; i < shinfo->nr_frags; i++)
+			__skb_frag_unref(&shinfo->frags[i]);
+
+		if (shinfo->frag_list)
+			kfree_skb_list(shinfo->frag_list);
+
+		skb_free_head(skb);
+	}
+	kfree_skbmem(skb);
+}
+EXPORT_SYMBOL(kfree_skb_wo_zcopy_clear);
+
 /**
  *	skb_tx_error - report an sk_buff xmit error
  *	@skb: buffer that triggered an error
@@ -1241,6 +1318,7 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	skb_shinfo(skb)->nr_frags = new_frags;
 
 release:
+	printk(KERN_DEBUG "skb_zcopy_clear");
 	skb_zcopy_clear(skb, false);
 	return 0;
 }
@@ -1262,6 +1340,8 @@ EXPORT_SYMBOL_GPL(skb_copy_ubufs);
 
 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)
 {
+	/* zym */
+	//printk(KERN_DEBUG "skb_clone");
 	struct sk_buff_fclones *fclones = container_of(skb,
 						       struct sk_buff_fclones,
 						       skb1);
@@ -1980,8 +2060,10 @@ end:
 	skb->tail     += delta;
 	skb->data_len -= delta;
 
-	if (!skb->data_len)
+	if (!skb->data_len){
+		printk(KERN_DEBUG "skb_zcopy");	/* zym */
 		skb_zcopy_clear(skb, false);
+	}
 
 	return skb_tail_pointer(skb);
 }

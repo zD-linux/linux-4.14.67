@@ -110,6 +110,12 @@ struct vhost_net_virtqueue {
 	struct vhost_net_ubuf_ref *ubufs;
 	struct skb_array *rx_array;
 	struct vhost_net_buf rxq;
+
+	/* zym */
+	int backoff_upend_idx;
+	u16 backoff_last_avail_idx;
+	bool in_queue;
+	bool vring_stopped;
 };
 
 struct vhost_net {
@@ -350,6 +356,9 @@ static void vhost_zerocopy_callback(struct ubuf_info *ubuf, bool success)
 
 	rcu_read_lock_bh();
 
+	/* zym */
+	struct vhost_net_virtqueue *nvq = container_of(vq, struct vhost_net_virtqueue, vq);
+
 	/* set len to mark this desc buffers done DMA */
 	vq->heads[ubuf->desc].len = success ?
 		VHOST_DMA_DONE_LEN : VHOST_DMA_FAILED_LEN;
@@ -362,10 +371,66 @@ static void vhost_zerocopy_callback(struct ubuf_info *ubuf, bool success)
 	 * (the value 16 here is more or less arbitrary, it's tuned to trigger
 	 * less than 10% of times).
 	 */
-	if (cnt <= 1 || !(cnt % 16))
+	if (cnt <= 1 || !(cnt % 16) || nvq->vring_stopped)
 		vhost_poll_queue(&vq->poll);
+	nvq->vring_stopped = false;
 
 	rcu_read_unlock_bh();
+}
+
+/* zym */
+static void qfull_callback(struct ubuf_info *ubuf){
+	struct vhost_net_ubuf_ref *ubufs = ubuf->ctx;
+	struct vhost_virtqueue *vq = ubufs->vq;
+	int cnt;
+	struct vhost_net_virtqueue *nvq = container_of(vq, struct vhost_net_virtqueue, vq);
+
+	rcu_read_lock_bh();
+
+	//if vhost_net_virtqueue is not in the global list, add it to the global list and update the upend_idx and last_avail_idx	
+	if(!nvq->in_queue){
+		nvq->upend_idx = ubuf->desc;
+		vq->last_avail_idx = ubuf->backoff_last_avail_idx;
+		nvq->backoff_upend_idx = ubuf->desc;
+		nvq->in_queue = true;
+	}
+	nvq->vring_stopped = true;
+	
+	cnt = vhost_net_ubuf_put(ubufs);
+
+	rcu_read_unlock_bh();
+}
+
+/* zym */
+static bool qavail_callback(struct ubuf_info *ubuf)
+{
+	struct vhost_net_ubuf_ref *ubufs = ubuf->ctx;
+	struct vhost_virtqueue *vq = ubufs->vq;
+	int cnt;
+	struct vhost_net_virtqueue *nvq = container_of(vq, struct vhost_net_virtqueue, vq);
+	bool pass = false;
+
+	rcu_read_lock_bh();
+
+	//if the nvq is not in the global list (not backoff before), continue passing the packet to the lower layer
+	if(!nvq->in_queue){
+		pass = true;
+	}
+	else{
+		/*if nvq is in the global list: (1) if the packet is the original packet that should be resent, pass the packet to the lower layer and remove the nvq from the global list;
+		(2) if the packet should be sent later than the original packet, drop the packet */
+		if(ubuf->desc <= nvq->backoff_upend_idx){
+			nvq->in_queue = false;
+			pass = true;
+		}
+		else{
+			pass = false;
+		}
+	}
+
+	rcu_read_unlock_bh();
+
+	return pass;
 }
 
 static inline unsigned long busy_clock(void)
@@ -442,6 +507,7 @@ static bool vhost_exceeds_maxpend(struct vhost_net *net)
 
 /* Expects to be always run from workqueue - which acts as
  * read-size critical section for our kind of RCU. */
+int tx_counter = 0;
 static void handle_tx(struct vhost_net *net)
 {
 	struct vhost_net_virtqueue *nvq = &net->vqs[VHOST_NET_VQ_TX];
@@ -476,6 +542,7 @@ static void handle_tx(struct vhost_net *net)
 	zcopy = nvq->ubufs;
 
 	for (;;) {
+		
 		/* Release DMAs done buffers first */
 		if (zcopy)
 			vhost_zerocopy_signal_used(net, vq);
@@ -485,6 +552,11 @@ static void handle_tx(struct vhost_net *net)
 		 */
 		if (unlikely(vhost_exceeds_maxpend(net)))
 			break;
+
+		/* zym */
+		if(nvq->vring_stopped){
+			break;
+		}
 
 		head = vhost_net_tx_get_vq_desc(net, vq, vq->iov,
 						ARRAY_SIZE(vq->iov),
@@ -524,13 +596,20 @@ static void handle_tx(struct vhost_net *net)
 				   && vhost_net_tx_select_zcopy(net);
 
 		/* use msg_control to pass vhost zerocopy ubuf info to skb */
-		if (zcopy_used) {
+		if(zcopy_used) {
 			struct ubuf_info *ubuf;
 			ubuf = nvq->ubuf_info + nvq->upend_idx;
 
 			vq->heads[nvq->upend_idx].id = cpu_to_vhost32(vq, head);
 			vq->heads[nvq->upend_idx].len = VHOST_DMA_IN_PROGRESS;
 			ubuf->callback = vhost_zerocopy_callback;
+
+			/* zym */
+			ubuf->vhost_qavail_callback = qavail_callback;
+			ubuf->vhost_qfull_callback = qfull_callback;
+			ubuf->vq = 1;
+			ubuf->backoff_last_avail_idx = (vq->last_avail_idx-1);
+
 			ubuf->ctx = nvq->ubufs;
 			ubuf->desc = nvq->upend_idx;
 			refcount_set(&ubuf->refcnt, 1);
@@ -934,6 +1013,11 @@ static int vhost_net_open(struct inode *inode, struct file *f)
 		n->vqs[i].vhost_hlen = 0;
 		n->vqs[i].sock_hlen = 0;
 		vhost_net_buf_init(&n->vqs[i].rxq);
+
+		n->vqs[i].backoff_upend_idx = 0;	/* zym */
+		n->vqs[i].backoff_last_avail_idx = 0;
+		n->vqs[i].in_queue = false;
+		n->vqs[i].vring_stopped = false;
 	}
 	vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX);
 
