@@ -306,6 +306,13 @@ EXPORT_SYMBOL(tcp_memory_allocated);
 struct percpu_counter tcp_sockets_allocated;
 EXPORT_SYMBOL(tcp_sockets_allocated);
 
+/* zym */
+struct qbackoff_list *qbackoff_global_list;
+EXPORT_SYMBOL(qbackoff_global_list);
+
+spinlock_t *qbackoff_global_lock;
+EXPORT_SYMBOL(qbackoff_global_lock);
+
 /*
  * TCP splice context
  */
@@ -415,6 +422,9 @@ void tcp_init_sock(struct sock *sk)
 	tp->out_of_order_queue = RB_ROOT;
 	tcp_init_xmit_timers(sk);
 	INIT_LIST_HEAD(&tp->tsq_node);
+
+    INIT_LIST_HEAD(&tp->qbackoff_node);     /* zym */
+    INIT_LIST_HEAD(&tp->qbackoff_global_node);
 
 	icsk->icsk_rto = TCP_TIMEOUT_INIT;
 	tp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
@@ -3558,4 +3568,5 @@ void __init tcp_init(void)
 	tcp_metrics_init();
 	BUG_ON(tcp_register_congestion_control(&tcp_reno) != 0);
 	tcp_tasklet_init();
+
 }

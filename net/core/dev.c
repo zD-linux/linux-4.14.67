@@ -146,6 +146,8 @@
 #include <linux/sctp.h>
 #include <net/udp_tunnel.h>
 
+#include <net/tcp.h>    /* zym */
+
 #include "net-sysfs.h"
 
 /* Instead of increasing this, you should create a hash table. */
@@ -3159,6 +3161,7 @@ static void qdisc_pkt_len_init(struct sk_buff *skb)
 	}
 }
 
+
 static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 				 struct net_device *dev,
 				 struct netdev_queue *txq)
@@ -3167,7 +3170,11 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 	struct sk_buff *to_free = NULL;
 	bool contended;
 	int rc;
+    struct tcp_sock *tp = tcp_sk(skb->sk);
 
+    unsigned long flags;
+    
+    
 	qdisc_calculate_pkt_len(skb, q);
 	/*
 	 * Heuristic to force contended enqueues to serialize on a
@@ -3180,6 +3187,126 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 		spin_lock(&q->busylock);
 
 	spin_lock(root_lock);
+
+    /* zym: check if qdisc is full */
+    if(tp && q->q.qlen  >= qdisc_dev(q)->tx_queue_len){
+        struct sk_buff_fclones *fclones = container_of(skb, struct sk_buff_fclones, skb2);
+        struct sk_buff *fskb;
+        //if it is a data packet (SKB_FCLONE_CLONE is set to 1), mark qbackoff_skb_pushed to 1 (meaning it has been pushed back by qdisc) and store the skb size
+        if(fclones && skb->fclone == SKB_FCLONE_CLONE){
+            fskb = &fclones->skb1;
+            struct tcp_skb_cb *tcb;
+            tcb = TCP_SKB_CB(fskb);
+            if(tcb)
+                tcb->qbackoff_skb_pushed=1;
+            fskb->qbackoff_wmem_delta += skb->truesize-1;
+        }
+        else{
+            //if it is an ack, just free it
+            kfree_skb(skb);
+            goto exit;
+        }
+
+        qbackoff_free_skb(skb);
+       
+        //set tp->qbackoff_flags to QBACKOFF_STOP
+        unsigned long flags, nval, oval;
+        for(oval = READ_ONCE(tp->qbackoff_flags);; oval = nval){
+            if(oval & QBACKOFF_GLOBAL_QUEUED_B){
+                goto exit;
+            }
+            nval = oval | QBACKOFF_STOP_B | QBACKOFF_GLOBAL_QUEUED_B;
+            nval = cmpxchg(&tp->qbackoff_flags, oval, nval);
+                        
+            if(nval != oval)
+                continue;
+            break;
+        }
+       
+        //add tp to the global list
+        spin_lock_irqsave(qbackoff_global_lock, flags);
+        list_add_tail(&tp->qbackoff_global_node, &qbackoff_global_list->head);
+        qbackoff_global_list->len++;
+        spin_unlock_irqrestore(qbackoff_global_lock, flags);
+
+exit:   if(unlikely(contended))
+            spin_unlock(&q->busylock);
+        spin_unlock(root_lock);
+		return NET_XMIT_BACKOFF;
+	}
+    
+    //logic to ensure fairness
+    if(tp){
+        struct sk_buff_fclones *fclones = container_of(skb, struct sk_buff_fclones, skb2);
+        struct sk_buff *fskb;
+        //We only process the data packet here (ack packet do not need to go through the check here). if SKB_FCLONE_CLONE is set, the skb is a data packet. 
+        if(fclones && skb->fclone == SKB_FCLONE_CLONE){
+            fskb = &fclones->skb1;
+            struct tcp_skb_cb *tcb;
+            tcb = TCP_SKB_CB(fskb);
+            
+            //if the packet is just released from the global list, pass the packet to qdisc
+            if(tcb && tcb->qbackoff_skb_pushed == 1){
+                refcount_sub_and_test(fskb->qbackoff_wmem_delta, &skb->sk->sk_wmem_alloc);
+                fskb->qbackoff_wmem_delta = 0;
+                tcb->qbackoff_skb_pushed = 0;
+                tp->qbackoff_pktcount++;
+                goto normal_path;
+            } 
+            
+            //if the socket has been released from the global list but has sent less than 2 packets, pass the packet to qdisc. 
+            if(tp->qbackoff_pktcount < 2){
+                tp->qbackoff_pktcount++;
+                goto normal_path;
+            }
+            else{
+                //if the flow has sent two packets and the global list is not empty (meaning that there are sockets wait to be resumed, stopped this socket and put it into the global list
+                if(!list_empty(&qbackoff_global_list->head)){
+                    //always let the first and the second packets of a flow to pass
+                    if(fskb != skb->sk->sk_write_queue.next && fskb->prev != skb->sk->sk_write_queue.next){
+                        tp->qbackoff_pktcount++;
+                        goto normal_path;
+                    }
+                    
+                    fskb->qbackoff_wmem_delta += skb->truesize-1;
+                    tcb->qbackoff_skb_pushed = 1;
+                    tp->qbackoff_pktcount = 0;    
+                    qbackoff_free_skb(skb);
+            
+                    unsigned long flags, nval, oval;
+                    for(oval = READ_ONCE(tp->qbackoff_flags);; oval = nval){
+                        if(oval & QBACKOFF_GLOBAL_QUEUED_B){
+                            goto exit_1;
+                        }
+                        nval = oval | QBACKOFF_STOP_B | QBACKOFF_GLOBAL_QUEUED_B;
+                        nval = cmpxchg(&tp->qbackoff_flags, oval, nval);
+                        
+                        if(nval != oval)
+                            continue;
+                        break;
+                    }
+       
+                    //add tp to the global list
+                    spin_lock_irqsave(qbackoff_global_lock, flags);
+                    list_add_tail(&tp->qbackoff_global_node, &qbackoff_global_list->head);
+                    qbackoff_global_list->len++;
+                    spin_unlock_irqrestore(qbackoff_global_lock, flags);
+
+exit_1:     
+                    if(unlikely(contended))
+                        spin_unlock(&q->busylock);
+                    spin_unlock(root_lock);
+		            return NET_XMIT_BACKOFF;
+
+                }
+            }
+            
+        }
+        
+   }
+
+normal_path:
+
 	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
 		__qdisc_drop(skb, &to_free);
 		rc = NET_XMIT_DROP;
@@ -3218,6 +3345,7 @@ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
 		kfree_skb_list(to_free);
 	if (unlikely(contended))
 		spin_unlock(&q->busylock);
+
 	return rc;
 }
 

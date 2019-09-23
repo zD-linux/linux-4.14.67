@@ -96,6 +96,7 @@ void netdev_set_default_ethtool_ops(struct net_device *dev,
 #define NET_XMIT_DROP		0x01	/* skb dropped			*/
 #define NET_XMIT_CN		0x02	/* congestion notification	*/
 #define NET_XMIT_MASK		0x0f	/* qdisc flags in net/sch_generic.h */
+#define NET_XMIT_BACKOFF	0x03    /* zym: qdisc full notification */
 
 /* NET_XMIT_CN is special. It does not guarantee that this packet is lost. It
  * indicates that the device will soon be dropping packets, or already drops

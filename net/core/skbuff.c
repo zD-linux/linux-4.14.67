@@ -660,6 +660,28 @@ void kfree_skb(struct sk_buff *skb)
 }
 EXPORT_SYMBOL(kfree_skb);
 
+/* zym */
+void qbackoff_free_skb(struct sk_buff *skb)
+{
+    if (!skb_unref(skb))
+         return;
+
+    trace_kfree_skb(skb, __builtin_return_address(0));
+
+    skb_dst_drop(skb);
+    secpath_reset(skb);
+#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+    nf_conntrack_put(skb_nfct(skb));
+#endif
+#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+    nf_bridge_put(skb->nf_bridge);
+#endif
+    if (likely(skb->head))
+          skb_release_data(skb);
+    kfree_skbmem(skb);
+}
+EXPORT_SYMBOL(qbackoff_free_skb);
+
 void kfree_skb_list(struct sk_buff *segs)
 {
 	while (segs) {
